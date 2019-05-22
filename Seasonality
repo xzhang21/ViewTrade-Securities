@@ -1,0 +1,250 @@
+# -*- coding: utf-8 -*-
+"""This script calculate and plot seasonality using multinomial regression. 
+Created on Fri Mar 29 17:14:44 2019
+
+@author: Lauren
+refer: seasonal_decompose.  https://www.statsmodels.org/dev/_modules/statsmodels/tsa/seasonal.html#seasonal_decompose
+"""
+
+from pandas import Series,DataFrame
+import matplotlib.pyplot as plt
+from numpy import histogram,nan
+from pandas.core.nanops import nanmean as pd_nanmean
+import numpy as np
+from statsmodels.tsa.filters.filtertools import convolution_filter
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score       
+from get_data import collect_data
+       
+def check_weekday(date):
+    weekno = date.weekday()
+    if weekno==0:
+        label = 'Monday'
+    if weekno==1:
+        label = 'Tueday'
+    if weekno==2:
+        label = 'Wednesday'
+    if weekno==3:
+        label = 'Thursday'
+    if weekno==4:
+        label = 'Friday'
+    if weekno==5:
+        label = 'Saturday'
+    if weekno==6:
+        label = 'Sunday'
+    return label
+       
+
+def fill_data(series,method):
+    ''' Fill missing data in time series
+    Parameters
+    ----------
+    series: series
+        a time series 
+    method: string
+        'ffill':  propagate last valid observation forward to next
+        'bfill'/'backfill': use NEXT valid observation to fill gap
+    method : {‘backfill’, ‘bfill’, ‘pad’, ‘ffill’, None}, default None
+
+    Returns
+    -------
+    series: series
+        The filled time series
+    '''
+    df = DataFrame(series)
+    df = df.resample('D').fillna(method)
+    #series=df['Open']
+    return series
+    
+# =============================================================================
+# def count(series,freq):
+#     series = fill_data(series,method='ffill')
+#     price = series.values
+#     price = DataFrame([price[i:i + freq] for i in range(0, len(series), freq)])
+# 
+#     avgPrice = DataFrame(price.sum()/len(price))
+#     label = check_weekday(series.index[0])
+#     x = avgPrice.index
+#     y=avgPrice[0]
+#     plt.plot(x,y)
+#     plt.xlabel("Date")
+#     plt.ylabel("Average Price")
+#     if freq==7:
+#         plt.title('Starting from %s'%label)
+#     else:
+#         plt.title('Counting method: Starting from %s'%series.index[0])
+#     plt.show()
+# =============================================================================
+    
+def _extrapolate_trend(trend, npoints):
+    """
+    Replace nan values on trend's end-points with least-squares extrapolated
+    values with regression considering npoints closest defined points.
+    """
+    front = next(i for i, vals in enumerate(trend)
+                 if not np.any(np.isnan(vals)))
+    back = trend.shape[0] - 1 - next(i for i, vals in enumerate(trend[::-1])
+                                     if not np.any(np.isnan(vals)))
+    front_last = min(front + npoints, back)
+    back_first = max(front, back - npoints)
+
+    k, n = np.linalg.lstsq(
+        np.c_[np.arange(front, front_last), np.ones(front_last - front)],
+        trend[front:front_last], rcond=-1)[0]
+    extra = (np.arange(0, front) * np.c_[k] + np.c_[n]).T
+    if trend.ndim == 1:
+        extra = extra.squeeze()
+    trend[:front] = extra
+
+    k, n = np.linalg.lstsq(
+        np.c_[np.arange(back_first, back), np.ones(back - back_first)],
+        trend[back_first:back], rcond=-1)[0]
+    extra = (np.arange(back + 1, trend.shape[0]) * np.c_[k] + np.c_[n]).T
+    if trend.ndim == 1:
+        extra = extra.squeeze()
+    trend[back + 1:] = extra
+
+    return trend    
+def seasonal_mean(x, freq):
+    """
+    Return means for each period in x. freq is an int that gives the
+    number of periods per cycle. E.g., 12 for monthly. NaNs are ignored
+    in the mean.
+    """
+    return np.array([pd_nanmean(x[i::freq], axis=0) for i in range(freq)])
+
+def polynomial_fit(x,y,degree):
+    """ fit polynomial regression to data 
+    
+    Parameters
+    ----------
+    x: series
+    y: series
+    degree: int
+    
+    Returns
+    -------
+    lin2: linearRegression
+    y_poly_pred: series
+        prediction
+    rmse: double
+        mean square error between prediction and empirical data
+    """
+    poly_reg = PolynomialFeatures(degree) # Generate a new feature matrix consisting of all polynomial combinations of the features
+    X_poly = poly_reg.fit_transform(x) # fit data, then transform it. return transformed X.       
+    lin2 = LinearRegression() 
+    lin2.fit(X_poly, y) 
+    y_poly_pred = lin2.predict(X_poly)     
+    rmse = np.sqrt(mean_squared_error(y,y_poly_pred))
+            
+    return lin2,rmse
+
+def remove_trend(series,freq):
+    """ remove trend for time series data
+    
+    Parameters
+    ----------
+    series: series
+        time series data
+    freq: str
+        frequency for seasonality
+    
+    Returns
+    -------
+    series
+        a detrended time series
+    """
+    filt = np.repeat(1./freq, freq)
+    trend = convolution_filter(series, filt, 2)#smoothe the time series using the “centred moving average“. 
+    trend  = _extrapolate_trend(trend,freq)
+    detrended = series - trend
+    
+    return detrended
+
+def split_data(series, freq, splitratio = 0.7):
+    """split data into training part and validation part
+    
+    Parameters
+    ---------
+    series: series
+        A time series 
+    freq: str
+        Frequency for seasonality
+        
+    Returns
+    -------
+    Y_train: series
+    Y_validate: series
+    """
+    n = int(len(series)/freq)# number of periods
+    split = int(n*splitratio)*freq# get first 70% of periods as training data
+    Y_train, Y_validate= series[:split], series[split:]
+    
+    return Y_train,Y_validate
+
+    
+    
+
+def main():
+    XOM = Series.from_csv('data\XOM.csv', header=0)# if header=0, skip 0 row 
+    # download sp500 indices historical data from https://quotes.wsj.com/index/XX/NULL/GSPT/historical-prices
+    GSPD = Series.from_csv('data\GSPD.csv', header=0) # 
+    GSPS = Series.from_csv('data\GSPS.csv', header=0)
+    GSPA = Series.from_csv('data\GSPA.csv', header=0)
+    GSPI = Series.from_csv('data\GSPI.csv', header=0)
+    GSPT = Series.from_csv('data\GSPT.csv', header=0)
+    GSPM = Series.from_csv('data\GSPM.csv', header=0)
+    GSPL = Series.from_csv('data\GSPL.csv', header=0)
+    GSPU = Series.from_csv('data\GSPU.csv', header=0)
+    GSPF = Series.from_csv('data\GSPF.csv', header=0)
+    GSPE = Series.from_csv('data\GSPE.csv', header=0)
+    SPX = Series.from_csv('data\SPX.csv', header=0)
+    series = Series(SPX)
+    
+    freq = "weekly"
+    if freq=="annually":
+        freq=366
+    if freq=="monthly":
+        freq=30
+    if freq=="weekly":
+        freq=7
+    series  = fill_data(series,method='ffill')# fill missing data
+    # remove trend
+    detrended = remove_trend(series, freq)
+    
+    # split data into train and validation parts
+    Y_train,Y_validate = split_data(detrended, freq)
+    X = np.asarray(range(0,freq)).reshape(-1,1)
+    # calculate average price for each period
+    period_averages_train = seasonal_mean(Y_train, freq)
+    period_averages_validate = seasonal_mean(Y_validate, freq)
+    
+    # find best degree for polynomial regression
+    degrees = range(0,15)
+    rmses_train = []
+    rmses_validate = []
+    for i in degrees:
+        lin2, rmse_train = polynomial_fit(X, period_averages_train, degree = i)
+        rmses_train.append(rmse_train)
+        
+        #r2 = r2_score(period_averages_train,y_poly_pred)#R-squared = Explained variation / Total variation
+        lin2, rmse_validate = polynomial_fit(X, period_averages_validate, degree = i)
+        rmses_validate.append(rmse_validate)
+    
+    plt.plot(rmses_train)
+    plt.plot(rmses_validate)
+    plt.show()
+    # get best degree
+    bestdegree = rmses_validate.index(min(rmses_validate)) 
+    print("Best degree is: %s"%bestdegree)
+    # fit model using best dgree
+    lin2,rmse = polynomial_fit(X,period_averages_train,bestdegree)
+    # visualization error
+    plt.plot(X, y_poly_pred, color='blue')    
+    plt.plot(X, period_averages_train, 'o')
+    plt.title("Polynomial Regression Method")
+    plt.show()
+    
+#if __name__=="_main_":    
+main()
